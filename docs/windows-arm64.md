@@ -139,3 +139,77 @@ An embedding application's already-installed CubeCL configuration takes
 priority. The `CUBECL_AUTOTUNE_CACHE` and `CUBECL_THROUGHPUT_CACHE` environment
 overrides also remain available for diagnosis. Re-enabling either cache with
 the locked dependency versions can produce `database is readonly` warnings.
+
+## Large-model corruption on Adreno
+
+A later investigation found a second failure on the same X1-45 and driver
+`31.0.148.0`: variable shader addresses wrap at **256 MiB**, even though DX12
+advertises a storage-buffer limit of nearly 2 GiB. Uploading and copying the
+same buffer back succeeds. A three-invocation compute shader reproduces the
+wrong writes without Brush training, Burn tensor operations, or a dataset.
+Both FXC and DXC reproduce the dynamic-address failure, with shader bounds
+checks enabled or disabled.
+
+At SH degree 3, each splat has 48 float32 color coefficients (192 bytes).
+The buffer crosses 256 MiB at splat 1,398,102. In the supplied checkpoints,
+corruption started at exactly this boundary: the overflowing tail overwrote
+the beginning of the color buffer, and later training propagated invalid
+values into positions. The healthy checkpoint contained 1,223,015 splats and
+no non-finite values; a later 1,443,141-splat checkpoint contained 133,324
+NaNs or infinities. Zeroed color coefficients also explain the gray/white
+splats. These measurements establish an addressing failure; they do not show
+that the machine ran out of system RAM.
+
+Brush now limits Windows Qualcomm storage buffers to 256 MiB. The effective
+training budget is derived from the largest per-splat buffer, including the
+backward pass's dummy row and the optional LOD Hessian. At SH degree 3 the
+maximum is **1,398,100 splats**. Training reports the limit, stops growth there,
+and continues optimizing and replacing splats. Lower requested limits remain
+in effect. Other GPUs retain their advertised limits. This is a workaround
+for the reproduced driver behavior; it does not repair the driver or enable
+larger buffers on it.
+
+Oversized models opened for viewing report an error, and oversized custom
+render allocations fail before launching their shaders. Initial training
+clouds follow the existing subsampling behavior with a warning that includes
+the effective budget. Invalid values detected during refinement are also
+reported in the normal training log.
+
+To reproduce the underlying driver bug independently of these guards:
+
+```powershell
+cargo run --release --locked -p brush-process --example adreno_buffer_boundary
+```
+
+This diagnostic allocates slightly more than 256 MiB and deliberately tests
+the GPU's advertised capability. A correct result has `[22, 33]` immediately
+past the boundary, with zeros at the beginning. The affected driver writes
+`[22, 33]` at the beginning instead, and the diagnostic fails its assertion.
+`WGPU_DX12_COMPILER=fxc` selects FXC for this diagnostic; `dxc` requires a
+matching `dxcompiler.dll` on the process search path.
+
+The Windows cache workaround also disables CubeCL environment session records.
+They use the same Turso database independently of the autotuning cache and can
+otherwise retry a failed database open for every newly compiled kernel.
+`CUBECL_ENVIRONMENT_RECORDS` remains available as an explicit override.
+
+### Large-model validation
+
+A headless native run resumed the supplied healthy 1,223,015-splat checkpoint
+with all 714 images at 1200 pixels. It completed 3,001 additional training
+steps (start iteration 5,000, end 8,001), including repeated refinements at
+1,398,100 splats. The final export contained no NaNs/infinities and no all-zero
+SH rows. Ten matching training views improved in mean PSNR from 24.86 to
+26.87 dB and mean SSIM from 0.878 to 0.894; inspected renders showed no bright
+colored blobs or spreading gray/white corruption. These are training-view
+checks, not held-out quality measurements. Resuming a PLY resets optimizer
+state, and the test used an 8,001-step horizon; it is not an exact continuation
+of the original 30,000-step run or a full-length validation.
+
+The minimal standalone diagnostic also reproduced the wraparound with only
+the required storage-buffer limits enabled. Chrome 153 on this machine
+already exposes a 256 MiB storage-binding limit, so it refuses this oversized
+binding before shader execution. Brush derives the browser splat budget
+from that advertised limit. The native buffer-address defect alone does not
+explain the public demo's separate failure at the first refinement with a
+large number of images. The public deployment has not been changed.

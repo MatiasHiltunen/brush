@@ -76,6 +76,9 @@ fn configure_runtime() {
             // in-memory results, without repeated failing database writes.
             config.autotune.disable_cache = true;
             config.throughput.disable_cache = true;
+            // Session records use the same database independently of those
+            // caches, and otherwise retry a failed open for every new kernel.
+            config.environment.records.level = burn::cubecl::records::RecordLevel::Off;
             // An embedding application's existing configuration takes priority;
             // environment overrides also remain available for diagnosis.
             CubeClRuntimeConfig::try_set(config.override_from_env());
@@ -239,6 +242,23 @@ async fn run_process<
             while let Some(message) = splat_stream.next().await {
                 let message = message?;
 
+                let degree = message
+                    .data
+                    .sh_coeffs
+                    .as_ref()
+                    .filter(|_| message.data.num_splats() > 0)
+                    .map_or(0, |sh| {
+                        brush_render::sh::sh_degree_from_coeffs(
+                            (sh.len() / message.data.num_splats() / 3) as u32,
+                        )
+                    });
+                let safe_max = brush_render::gpu_limits::max_splats(device, degree, false);
+                let model_count =
+                    (message.meta.total_splats as usize).max(message.data.num_splats());
+                anyhow::ensure!(
+                    model_count <= safe_max as usize,
+                    "This model has {model_count} splats at SH degree {degree}, exceeding this GPU's safe limit of {safe_max}. Use a smaller model or a GPU with a larger safe buffer limit."
+                );
                 let mode = message.meta.render_mode.unwrap_or(SplatRenderMode::Default);
                 let splats = message.data.into_splats(device, mode);
 
