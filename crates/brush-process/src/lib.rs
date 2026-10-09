@@ -8,13 +8,41 @@ pub use brush_vfs::DataSource;
 pub type ProcessDevice = burn::tensor::Device;
 
 pub fn default_device() -> ProcessDevice {
-    WgpuDevice::default().into()
+    wgpu_device().into()
 }
 
-use burn_wgpu::{
-    RuntimeOptions, WgpuDevice,
-    graphics::{AutoGraphicsApi, GraphicsApi},
-};
+fn wgpu_device() -> WgpuDevice {
+    use burn::cubecl::wgpu::WgpuBackend;
+
+    configure_runtime();
+
+    // Keep the API in the device identity as well as its initial setup. On
+    // Windows ARM64, the Adreno Vulkan path fails after splat refinement.
+    let backend = if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        WgpuBackend::Dx12
+    } else {
+        WgpuBackend::Auto
+    };
+
+    // Allow backend comparisons without rebuilding; this also makes future
+    // driver regressions reproducible from CLI logs.
+    #[cfg(not(target_family = "wasm"))]
+    let backend = match std::env::var("BRUSH_WGPU_BACKEND") {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "auto" => WgpuBackend::Auto,
+            "dx12" => WgpuBackend::Dx12,
+            "vulkan" => WgpuBackend::Vulkan,
+            "metal" => WgpuBackend::Metal,
+            "gl" => WgpuBackend::Gl,
+            _ => panic!("BRUSH_WGPU_BACKEND must be auto, dx12, vulkan, metal, or gl"),
+        },
+        Err(_) => backend,
+    };
+
+    WgpuDevice::default().on(backend)
+}
+
+use burn_wgpu::{RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi};
 use wgpu::{Adapter, Device, Queue};
 
 use std::future::Future;
@@ -28,24 +56,48 @@ use brush_vfs::SendNotWasm;
 use tokio_stream::{Stream, StreamExt};
 
 fn burn_options() -> RuntimeOptions {
+    configure_runtime();
     RuntimeOptions {
         tasks_max: 64,
         memory_config: burn_wgpu::MemoryConfiguration::ExclusivePages,
     }
 }
 
+fn configure_runtime() {
+    #[cfg(target_os = "windows")]
+    {
+        use burn::cubecl::config::{CubeClRuntimeConfig, RuntimeConfig};
+
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let mut config = CubeClRuntimeConfig::from_current_dir();
+            // CubeCL's Turso cache requests multiprocess WAL, unsupported by
+            // Turso 0.8.2's default Windows IO backend. Keep autotuning's
+            // in-memory results, without repeated failing database writes.
+            config.autotune.disable_cache = true;
+            config.throughput.disable_cache = true;
+            // An embedding application's existing configuration takes priority;
+            // environment overrides also remain available for diagnosis.
+            CubeClRuntimeConfig::try_set(config.override_from_env());
+        });
+    }
+}
+
 pub async fn burn_init_setup() -> ProcessDevice {
-    burn_wgpu::init_setup_async::<AutoGraphicsApi>(&WgpuDevice::default(), burn_options()).await;
-    default_device()
+    let device = wgpu_device();
+    let setup = burn_wgpu::init_setup_async::<AutoGraphicsApi>(&device, burn_options()).await;
+    log::info!("GPU adapter: {:?}", setup.adapter.get_info());
+    device.into()
 }
 
 pub fn burn_init_device(adapter: Adapter, device: Device, queue: Queue) -> ProcessDevice {
+    let backend = adapter.get_info().backend;
     let setup = burn_wgpu::WgpuSetup {
         instance: wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle()), // unused... need to fix this in Burn.
         adapter,
         device,
         queue,
-        backend: AutoGraphicsApi::backend(),
+        backend,
     };
     let burn = burn_wgpu::init_device(setup, burn_options());
     burn.into()
